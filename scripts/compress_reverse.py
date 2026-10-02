@@ -13,6 +13,9 @@ Each large (768x768) q-net matrix M is split into the corpus mean matrix
         captures more energy, storing one (768, r) factor.
     tucker: D projected onto corpus-wide PCA bases on both sides, storing an
         (r, r) core.
+    layered: per-item truncated SVD like svd, with one rank for the first
+        layer (which reads the query vector) and another for the remaining
+        layers. A rank of 0 stores nothing and uses the corpus mean.
 The small matrices and bias vectors are always stored in full. With int8,
 every stored tensor is quantized symmetrically with one fp16 scale per vector
 along its longest axis.
@@ -63,6 +66,12 @@ def rank_for_energy(values: torch.Tensor, level: float) -> int:
     return int((cumulative < level).sum().item()) + 1
 
 
+def rank_label(rank) -> str:
+    if isinstance(rank, tuple):
+        return "/".join(str(k) for k in rank)
+    return str(rank)
+
+
 def maybe_quantize(x: torch.Tensor, int8: bool) -> torch.Tensor:
     return quantize_int8(x) if int8 else x
 
@@ -76,7 +85,17 @@ def main(
     num_calibration_queries: int = 1000,
     ranks: Sequence[int] = (1, 4, 16, 64),
     tucker_ranks: Sequence[int] = (16, 64, 256),
-    methods: Sequence[str] = ("svd", "shared", "tucker"),
+    layered_ranks: Sequence[Sequence[int]] = (
+        (16, 0),
+        (16, 1),
+        (16, 2),
+        (8, 0),
+        (8, 1),
+        (4, 0),
+        (4, 1),
+        (32, 1),
+    ),
+    methods: Sequence[str] = ("svd", "shared", "tucker", "layered"),
     query_max_length: int = 512,
     item_batch_size: int = 32,
     seed: int = 0,
@@ -156,7 +175,10 @@ def main(
     # ---- Configurations. ----
     configs = [{"method": "full", "rank": None}]
     for method in methods:
-        for rank in tucker_ranks if method == "tucker" else ranks:
+        method_ranks = {"tucker": tucker_ranks, "layered": layered_ranks}
+        for rank in method_ranks.get(method, ranks):
+            if method == "layered":
+                rank = tuple(rank)
             configs.append({"method": method, "rank": rank})
     configs = [dict(c, int8=q) for c in configs for q in (False, True)]
 
@@ -165,6 +187,11 @@ def main(
         method, k, q = config["method"], config["rank"], config["int8"]
         if method == "full":
             return maybe_quantize(M, q), [list(M.shape[1:])]
+
+        if method == "layered":
+            method, k = "svd", k[0] if i == big[0] else k[1]
+            if k == 0:
+                return means[i], []
 
         D = M - means[i]
         vec_l, vec_r, eval_l, eval_r = bases[i]
@@ -220,7 +247,7 @@ def main(
                 params, index.matrix_shapes, index.vector_shapes
             )
             svd = {}
-            if "svd" in methods:
+            if "svd" in methods or "layered" in methods:
                 svd = {
                     i: torch.linalg.svd(
                         matrices[i] - means[i], full_matrices=False
@@ -297,7 +324,7 @@ def main(
         )
         results.append(row)
         print(
-            f"{config['method']:8} {str(config['rank']):>5}"
+            f"{config['method']:8} {rank_label(config['rank']):>5}"
             f" {str(config['int8']):>5} {row['bytes_per_item'] / 1024:9.1f}"
             f" {row['msmarco_tb']:8.2f}T {row['relative_error']:7.3f}"
             f" {metrics['nDCG@10']:8.4f} {metrics['RR']:7.4f}"
