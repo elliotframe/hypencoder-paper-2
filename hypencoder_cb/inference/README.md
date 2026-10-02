@@ -94,3 +94,15 @@ python hypencoder_cb/inference/approx_retrieve.py \
 --query_max_length=64 \
 --top_k=1000
 ```
+
+##### Seeding the search with BM25
+By default the graph search starts from the same `--num_entry_points` random items for every query. With `--entry_points=bm25` it starts from the query's top `--num_entry_points` BM25 results. If BM25 matches nothing for a query, the search falls back to the random entry points. This requires `python-terrier` and `pyterrier-pisa`. The first run builds a PISA index from the encoded items at `--bm25_index_path`, so BM25 sees the same IDs and text as the neural search. Later runs reuse that index. Use a separate index path for each corpus.
+```
+python hypencoder_cb/inference/approx_retrieve.py \
+... # Same arguments as above
+--entry_points=bm25 \
+--bm25_index_path=path/to/pisa_index \
+--num_entry_points=1000 \
+--bm25_k1=1.5 \
+--bm25_b=0.75
+```

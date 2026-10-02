@@ -55,6 +55,8 @@ are required:
 - `numpy`
 - `ir_measures`
 
+Seeding approximate retrieval with BM25 also requires `python-terrier` and `pyterrier-pisa`.
+
 To train a model you will need:
 - `fire`
 - `omegaconf`

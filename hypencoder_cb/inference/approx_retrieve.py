@@ -1,7 +1,6 @@
 import copy
 import os
 import pickle
-import random
 from collections import defaultdict
 from queue import PriorityQueue
 from typing import Dict, List, Optional, Union
@@ -11,6 +10,11 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from hypencoder_cb.inference.entry_points import (
+    BM25EntryPoints,
+    EntryPointSelector,
+    RandomEntryPoints,
+)
 from hypencoder_cb.inference.retrieve import do_retrieval_shared
 from hypencoder_cb.inference.shared import (
     BaseRetriever,
@@ -40,6 +44,10 @@ class HypecoderGraphRetriever(BaseRetriever):
         early_stop: bool = True,
         dtype: Union[torch.dtype, str] = "float32",
         ignore_same_id: bool = False,
+        entry_points: str = "random",
+        bm25_index_path: Optional[str] = None,
+        bm25_k1: float = 1.5,
+        bm25_b: float = 0.75,
     ) -> None:
         """
 
@@ -59,9 +67,9 @@ class HypecoderGraphRetriever(BaseRetriever):
                 to use for loading the encoded items and item neighbors. If
                 the file does not exist, it will be created and the data will
                 stored in it. Defaults to None.
-            num_entry_points (int, optional): The number of randomly selected
-                initial entry points. This is equal to len(initial_candidates).
-                Defaults to 10_000.
+            num_entry_points (int, optional): The number of initial entry
+                points. This is equal to len(initial_candidates). Defaults
+                to 10_000.
             ncandidates (int, optional): The number of candidates to explore
                 as each step. Defaults to 50.
             max_iter (int, optional): The maximum number of candidate expansion
@@ -74,7 +82,24 @@ class HypecoderGraphRetriever(BaseRetriever):
             ignore_same_id (bool, optional): Whether to ignore retrievals
                 with the same ID as the query. This is only relevant for
                 certain datasets. Defaults to False.
+            entry_points (str, optional): How entry points are chosen.
+                "random" uses the same random items for every query. "bm25"
+                uses the query's top BM25 results, falling back to the random
+                items when BM25 matches nothing. Defaults to "random".
+            bm25_index_path (Optional[str], optional): Directory of the PISA
+                index used when `entry_points` is "bm25". It is built from the
+                encoded items if it does not exist. Defaults to None.
+            bm25_k1 (float, optional): BM25 k1. Defaults to 1.5.
+            bm25_b (float, optional): BM25 b. Defaults to 0.75.
         """
+
+        if entry_points not in ("random", "bm25"):
+            raise ValueError(f"Unknown entry_points type: {entry_points}")
+
+        if entry_points == "bm25" and bm25_index_path is None:
+            raise ValueError(
+                "bm25_index_path must be provided when entry_points is 'bm25'."
+            )
 
         if isinstance(dtype, str):
             dtype = dtype_lookup(dtype)
@@ -170,23 +195,40 @@ class HypecoderGraphRetriever(BaseRetriever):
                 with open(cache_file, "wb") as f:
                     pickle.dump(cache_values, f)
 
-        self._set_entry_points()
+        self.random_entry_points = RandomEntryPoints(
+            self.ids, self.num_entry_points
+        )
 
-    def _set_entry_points(self):
-        random.seed(43)
-        self.entry_point_indices = torch.Tensor(
-            random.sample(
-                range(self.encoded_item_embeddings.shape[0]),
-                self.num_entry_points,
-            ),
-        ).to(self.device, dtype=torch.long)
+        self.entry_point_selector: EntryPointSelector = (
+            self.random_entry_points
+        )
+        if entry_points == "bm25":
+            self.entry_point_selector = BM25EntryPoints(
+                index_path=bm25_index_path,
+                items=self.item_id_to_content.items(),
+                num_entry_points=self.num_entry_points,
+                k1=bm25_k1,
+                b=bm25_b,
+            )
 
-        self.entry_point_embeddings = self.encoded_item_embeddings[
-            self.entry_point_indices
+    def _get_entry_point_ids(self, query: TextQuery) -> List[str]:
+        entry_point_ids = self.entry_point_selector.select(query)
+
+        unknown_ids = [
+            item_id
+            for item_id in entry_point_ids
+            if item_id not in self.item_id_to_index
         ]
-        self.entry_point_ids = [
-            self.ids[idx] for idx in self.entry_point_indices
-        ]
+        if unknown_ids:
+            raise ValueError(
+                f"Entry points {unknown_ids[:5]} are not in the encoded items."
+                " Was the BM25 index built from a different corpus?"
+            )
+
+        if not entry_point_ids:
+            return self.random_entry_points.select(query)
+
+        return entry_point_ids
 
     def retrieve(self, query: TextQuery, top_k: int) -> List[Item]:
         tokenized_query = self.tokenizer(
@@ -206,7 +248,7 @@ class HypecoderGraphRetriever(BaseRetriever):
 
         final_queue = PriorityQueue(maxsize=top_k)
 
-        candidates = [x for x in self.entry_point_ids]
+        candidates = self._get_entry_point_ids(query)
         explored = set(candidates)
 
         curr_iter = 0
@@ -308,6 +350,10 @@ def do_retrieval(
     do_eval: bool = True,
     metric_names: Optional[List[str]] = None,
     ignore_same_id: bool = False,
+    entry_points: str = "random",
+    bm25_index_path: Optional[str] = None,
+    bm25_k1: float = 1.5,
+    bm25_b: float = 0.75,
 ) -> None:
     """Does retrieval and optionally evaluation.
 
@@ -319,9 +365,9 @@ def do_retrieval(
             Should have the keys "item_id" and "neighbors".
         output_dir (str): Path to the output directory which will contain the
             retrieval results and optionally the evaluation results.
-        num_entry_points (int, optional): The number of randomly selected
-            initial entry points. This is equal to len(initial_candidates).
-            Defaults to 10_000.
+        num_entry_points (int, optional): The number of initial entry
+            points. This is equal to len(initial_candidates). Defaults
+            to 10_000.
         ncandidates (int, optional): The number of candidates to explore
             as each step. Defaults to 50.
         max_iter (int, optional): The maximum number of candidate expansion
@@ -370,6 +416,13 @@ def do_retrieval(
         ignore_same_id (bool, optional): Whether to ignore retrievals with the
             same ID as the query. This is only relevant for certain datasets.
             Defaults to False.
+        entry_points (str, optional): "random" or "bm25". See
+            `HypecoderGraphRetriever` for details. Defaults to "random".
+        bm25_index_path (Optional[str], optional): Directory of the PISA
+            index, required when `entry_points` is "bm25". Built from the
+            encoded items if it does not exist. Defaults to None.
+        bm25_k1 (float, optional): BM25 k1. Defaults to 1.5.
+        bm25_b (float, optional): BM25 b. Defaults to 0.75.
 
     Raises:
         ValueError: If both `query_jsonl` and `ir_dataset_name` are provided.
@@ -395,6 +448,10 @@ def do_retrieval(
             early_stop=early_stop,
             device=device,
             cache_file=cache_file,
+            entry_points=entry_points,
+            bm25_index_path=bm25_index_path,
+            bm25_k1=bm25_k1,
+            bm25_b=bm25_b,
             **retriever_kwargs,
         ),
         output_dir=output_dir,
