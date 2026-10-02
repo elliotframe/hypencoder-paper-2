@@ -4,7 +4,10 @@ import fire
 import torch
 from transformers import AutoTokenizer
 
-from hypencoder_cb.inference.reverse import encode_q_nets_to_disk
+from hypencoder_cb.inference.reverse import (
+    calibrate_q_net_index,
+    encode_q_nets_to_disk,
+)
 from hypencoder_cb.inference.shared import (
     BaseEncoder,
     encode_ir_dataset_items_to_disk,
@@ -166,6 +169,10 @@ def do_encoding(
     dtype: str = "fp32",
     representation_type: str = "vector",
     q_net_storage_dtype: str = "fp16",
+    calibration_queries: Optional[str] = None,
+    num_calibration_queries: Optional[int] = 1000,
+    calibration_query_text_key: str = "text",
+    calibration_query_max_length: int = 64,
 ) -> None:
     """Encodes a dataset of items to disk using the specified model.
 
@@ -202,6 +209,17 @@ def do_encoding(
         q_net_storage_dtype (str, optional): The dtype q-net parameters are
             stored in, "fp16" or "fp32". Only used when `representation_type`
             is "q_net". Defaults to "fp16".
+        calibration_queries (Optional[str], optional): A JSONL file or an
+            ir_datasets dataset name. If provided with `representation_type`
+            "q_net", the index is calibrated after encoding, see
+            `reverse.calibrate_q_net_index`. Must not contain the evaluation
+            queries. Defaults to None.
+        num_calibration_queries (Optional[int], optional): How many
+            calibration queries to sample, or None for all. Defaults to 1000.
+        calibration_query_text_key (str, optional): The query text key when
+            `calibration_queries` is a JSONL file. Defaults to "text".
+        calibration_query_max_length (int, optional): Maximum length of the
+            calibration queries. Defaults to 64.
 
     Raises:
         ValueError: If both `jsonl_path` and `ir_dataset_name` are provided.
@@ -235,6 +253,17 @@ def do_encoding(
             batch_size=batch_size,
             storage_dtype=q_net_storage_dtype,
         )
+
+        if calibration_queries is not None:
+            calibrate_q_net_index(
+                model_name_or_path=model_name_or_path,
+                encoded_item_path=output_path,
+                calibration_queries=calibration_queries,
+                num_calibration_queries=num_calibration_queries,
+                query_text_key=calibration_query_text_key,
+                query_max_length=calibration_query_max_length,
+                dtype=dtype,
+            )
         return
 
     if representation_type != "vector":

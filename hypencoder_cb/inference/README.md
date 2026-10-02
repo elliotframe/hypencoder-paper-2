@@ -85,6 +85,19 @@ python hypencoder_cb/inference/retrieve.py \
 ```
 `--output_path` is a directory holding `q_nets.bin` (memory mapped at retrieval time), `items.jsonl`, and `meta.json`. Retrieval reads each batch of `--batch_size` q-nets (default 64) once and scores all queries with it, so a whole query set costs one pass over the index. `timing.json` therefore records the total time for the query set rather than per-query latency.
 
+##### Calibrating the q-net index
+Each item's q-net adds its own offset to every score, and training never makes these offsets comparable across q-nets, so raw reverse scores mostly rank items by that offset. Calibration scores a sample of other queries with every item's q-net and stores each item's mean and standard deviation in `calibration.npy`. Retrieval then standardizes each item's scores with them automatically. Pass `--retriever_kwargs='{"use_calibration": False}'` to get raw scores. The calibration queries must not include the evaluation queries.
+
+To calibrate an existing index:
+```
+python hypencoder_cb/inference/reverse.py \
+--model_name_or_path=$MODEL_NAME_OR_PATH \
+--encoded_item_path=$QNET_INDEX_DIR \
+--calibration_queries=msmarco-passage/train \
+--num_calibration_queries=1000
+```
+`--calibration_queries` takes an ir_datasets name or a JSONL file (text key set with `--query_text_key`). Calibrating while encoding works the same way: add `--calibration_queries=...` to the `encode.py --representation_type=q_net` command. Calibrating again overwrites the previous calibration, and `meta.json` records which queries were used.
+
 #### Approximate Retrieval
 ##### Getting a Item Neighbor Graph
 Approximate retrieval requires an item-to-item graph. To get this graph use the following command:

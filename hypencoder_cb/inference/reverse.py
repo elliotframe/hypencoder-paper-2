@@ -11,6 +11,14 @@ A q-net index is a directory containing:
     items.jsonl: One line per item, in the same order, with "id" and "text".
     meta.json: The number of items and parameters, the storage dtype, and the
         matrix and vector shapes needed to rebuild the q-nets.
+    calibration.npy: Optional, written by `calibrate_q_net_index`. Shape
+        (num_items, 2) float32 holding the mean and standard deviation of each
+        item's q-net scores over a sample of calibration queries.
+
+Each item's q-net adds its own offset to every score, and nothing in training
+makes these offsets comparable across q-nets, so raw scores mostly rank items
+by that offset. Calibration standardizes each item's scores with statistics
+from queries that are not being evaluated.
 
 Every q-net is large (about 3.5M parameters, 7 MB in fp16, for the 6 layer
 model), so this is only practical for small corpora.
@@ -18,9 +26,11 @@ model), so this is only practical for small corpora.
 
 import json
 import math
+import random
 from pathlib import Path
-from typing import Iterable, List, Protocol, Tuple, Union
+from typing import Iterable, List, Optional, Protocol, Tuple, Union
 
+import fire
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -35,6 +45,7 @@ from hypencoder_cb.utils.torch_utils import dtype_lookup
 Q_NETS_FILE = "q_nets.bin"
 ITEMS_FILE = "items.jsonl"
 META_FILE = "meta.json"
+CALIBRATION_FILE = "calibration.npy"
 
 STORAGE_DTYPES = {"fp16": torch.float16, "fp32": torch.float32}
 
@@ -175,9 +186,15 @@ class QNetIndex:
         with open(index_dir / META_FILE) as f:
             meta = json.load(f)
 
+        self.index_dir = index_dir
+        self.meta = meta
         self.matrix_shapes = meta["matrix_shapes"]
         self.vector_shapes = meta["vector_shapes"]
         self.num_items = meta["num_items"]
+
+        self.calibration = None
+        if (index_dir / CALIBRATION_FILE).exists():
+            self.calibration = np.load(index_dir / CALIBRATION_FILE)
 
         self.params = np.memmap(
             index_dir / Q_NETS_FILE,
@@ -221,6 +238,22 @@ class QNetIndex:
 
         return BackgroundGenerator(read(), 2)
 
+    def save_calibration(self, calibration: np.ndarray, info: dict) -> None:
+        """Writes per-item score statistics and records `info` in meta.json.
+
+        Args:
+            calibration (np.ndarray): Shape (num_items, 2), the mean and
+                standard deviation of each item's scores.
+            info (dict): Description of how the calibration was made.
+        """
+        np.save(
+            self.index_dir / CALIBRATION_FILE, calibration.astype(np.float32)
+        )
+        self.meta["calibration"] = info
+        with open(self.index_dir / META_FILE, "w") as f:
+            json.dump(self.meta, f, indent=2)
+        self.calibration = calibration
+
 
 class HypencoderReverseRetriever(BaseRetriever):
     implements_retrieve_batch = True
@@ -235,6 +268,7 @@ class HypencoderReverseRetriever(BaseRetriever):
         dtype: Union[torch.dtype, str] = "fp32",
         query_max_length: int = 32,
         ignore_same_id: bool = False,
+        use_calibration: bool = True,
     ) -> None:
         """Scores each query vector with every item's q-net.
 
@@ -258,6 +292,10 @@ class HypencoderReverseRetriever(BaseRetriever):
                 Defaults to 32.
             ignore_same_id (bool, optional): Whether to ignore retrievals
                 with the same ID as the query. Defaults to False.
+            use_calibration (bool, optional): Whether to standardize each
+                item's scores with the index's calibration statistics, if the
+                index has them (see `calibrate_q_net_index`). Defaults to
+                True.
         """
         if isinstance(dtype, str):
             dtype = dtype_lookup(dtype)
@@ -277,6 +315,18 @@ class HypencoderReverseRetriever(BaseRetriever):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
         self.index = QNetIndex(encoded_item_path)
+
+        self.calibration = None
+        if use_calibration and self.index.calibration is not None:
+            self.calibration = torch.from_numpy(self.index.calibration).to(
+                device
+            )
+            print(
+                "Standardizing scores with calibration from"
+                f" {self.index.meta['calibration']}."
+            )
+        elif use_calibration:
+            print("The q-net index has no calibration; using raw scores.")
 
     def _encode_queries(self, queries: List[TextQuery]) -> torch.Tensor:
         embeddings = []
@@ -299,21 +349,18 @@ class HypencoderReverseRetriever(BaseRetriever):
 
         return torch.cat(embeddings, dim=0)
 
-    def retrieve_batch(
-        self, queries: List[TextQuery], top_k: int
-    ) -> List[List[Item]]:
-        query_embeddings = self._encode_queries(queries)
-        num_queries = len(queries)
+    def _iter_scores(
+        self, query_embeddings: torch.Tensor
+    ) -> Iterable[Tuple[int, torch.Tensor]]:
+        """Applies every item's q-net to every query embedding.
 
-        # One extra so dropping the query's own item still leaves top_k.
-        k = min(top_k + int(self.ignore_same_id), len(self.index))
-        top_scores = torch.full(
-            (num_queries, k), -float("inf"), device=self.device
-        )
-        top_indices = torch.full(
-            (num_queries, k), -1, dtype=torch.long, device=self.device
-        )
+        Args:
+            query_embeddings (torch.Tensor): Shape (num_queries, dim).
 
+        Yields:
+            Tuple[int, torch.Tensor]: The index of the first item in the batch
+                and the raw scores with shape (num_queries, items_in_batch).
+        """
         with torch.no_grad(), tqdm(
             total=len(self.index), desc="Scoring items"
         ) as pbar:
@@ -329,17 +376,14 @@ class HypencoderReverseRetriever(BaseRetriever):
                     params, self.index.matrix_shapes, self.index.vector_shapes
                 )
                 q_nets = self.converter(matrices, vectors, is_training=False)
-                item_indices = torch.arange(
-                    start, start + num_items, device=self.device
-                )
 
-                for q_start in range(0, num_queries, self.query_batch_size):
-                    q_end = q_start + self.query_batch_size
-                    batch_queries = query_embeddings[q_start:q_end]
-
+                scores = []
+                for batch_queries in torch.split(
+                    query_embeddings, self.query_batch_size
+                ):
                     # Each item's q-net sees every query in the batch:
                     # (num_items, num_queries, dim) -> (num_queries, items).
-                    scores = (
+                    scores.append(
                         q_nets(
                             batch_queries.unsqueeze(0).expand(
                                 num_items, -1, -1
@@ -350,23 +394,59 @@ class HypencoderReverseRetriever(BaseRetriever):
                         .float()
                     )
 
-                    merged_scores, merged_positions = torch.topk(
-                        torch.cat([top_scores[q_start:q_end], scores], dim=1),
-                        k,
-                        dim=1,
-                    )
-                    merged_indices = torch.cat(
-                        [
-                            top_indices[q_start:q_end],
-                            item_indices.expand(scores.size(0), -1),
-                        ],
-                        dim=1,
-                    ).gather(1, merged_positions)
-
-                    top_scores[q_start:q_end] = merged_scores
-                    top_indices[q_start:q_end] = merged_indices
-
+                yield start, torch.cat(scores, dim=0)
                 pbar.update(num_items)
+
+    def calibrate(self, texts: List[str]) -> np.ndarray:
+        """Computes the mean and standard deviation of each item's scores.
+
+        Args:
+            texts (List[str]): Calibration query texts.
+
+        Returns:
+            np.ndarray: Shape (num_items, 2), float32.
+        """
+        query_embeddings = self._encode_queries(
+            [TextQuery(text=text) for text in texts]
+        )
+        stats = [
+            torch.stack([scores.mean(0), scores.std(0)], dim=1).cpu()
+            for _, scores in self._iter_scores(query_embeddings)
+        ]
+        return torch.cat(stats, dim=0).numpy()
+
+    def retrieve_batch(
+        self, queries: List[TextQuery], top_k: int
+    ) -> List[List[Item]]:
+        query_embeddings = self._encode_queries(queries)
+        num_queries = len(queries)
+
+        # One extra so dropping the query's own item still leaves top_k.
+        k = min(top_k + int(self.ignore_same_id), len(self.index))
+        top_scores = torch.full(
+            (num_queries, k), -float("inf"), device=self.device
+        )
+        top_indices = torch.full(
+            (num_queries, k), -1, dtype=torch.long, device=self.device
+        )
+
+        for start, scores in self._iter_scores(query_embeddings):
+            num_items = scores.size(1)
+
+            if self.calibration is not None:
+                mean, std = self.calibration[start : start + num_items].T
+                scores = (scores - mean) / std.clamp_min(1e-6)
+
+            item_indices = torch.arange(
+                start, start + num_items, device=self.device
+            ).expand(num_queries, -1)
+
+            top_scores, positions = torch.topk(
+                torch.cat([top_scores, scores], dim=1), k, dim=1
+            )
+            top_indices = torch.cat([top_indices, item_indices], dim=1).gather(
+                1, positions
+            )
 
         results = []
         for query, scores, indices in zip(
@@ -392,3 +472,92 @@ class HypencoderReverseRetriever(BaseRetriever):
 
     def retrieve(self, query: TextQuery, top_k: int) -> List[Item]:
         return self.retrieve_batch([query], top_k)[0]
+
+
+def load_query_texts(
+    source: str,
+    text_key: str = "text",
+) -> List[str]:
+    """Loads query texts from a JSONL file or an ir_datasets dataset.
+
+    Args:
+        source (str): Path to a JSONL file, or an ir_datasets dataset name.
+        text_key (str, optional): The query text key when `source` is a JSONL
+            file. Defaults to "text".
+
+    Returns:
+        List[str]: The query texts.
+    """
+    if Path(source).expanduser().is_file():
+        with JsonlReader(source) as reader:
+            return [line[text_key] for line in reader]
+
+    import ir_datasets
+
+    return [query.text for query in ir_datasets.load(source).queries_iter()]
+
+
+def calibrate_q_net_index(
+    model_name_or_path: str,
+    encoded_item_path: str,
+    calibration_queries: str,
+    num_calibration_queries: Optional[int] = 1000,
+    query_text_key: str = "text",
+    query_max_length: int = 64,
+    item_batch_size: int = 64,
+    dtype: str = "fp32",
+    seed: int = 0,
+) -> None:
+    """Adds per-item score statistics to a q-net index.
+
+    Each item's q-net scores a sample of calibration queries, and the mean
+    and standard deviation of those scores are saved so retrieval can
+    standardize each item's scores. The calibration queries must not include
+    the queries being evaluated.
+
+    Args:
+        model_name_or_path (str): The HypencoderDualEncoder used to build the
+            index.
+        encoded_item_path (str): Path to the q-net index directory.
+        calibration_queries (str): A JSONL file or an ir_datasets dataset name
+            to take calibration queries from, e.g. "msmarco-passage/train" or
+            the train split of the evaluation dataset.
+        num_calibration_queries (Optional[int], optional): How many queries
+            to sample. If None, all of them are used. Defaults to 1000.
+        query_text_key (str, optional): The query text key when
+            `calibration_queries` is a JSONL file. Defaults to "text".
+        query_max_length (int, optional): Maximum length of the calibration
+            queries. Defaults to 64.
+        item_batch_size (int, optional): Number of item q-nets applied at
+            once. Defaults to 64.
+        dtype (str, optional): The dtype for the model and q-nets. Defaults
+            to "fp32".
+        seed (int, optional): Seed for sampling the queries. Defaults to 0.
+    """
+    texts = load_query_texts(calibration_queries, text_key=query_text_key)
+    if num_calibration_queries is not None:
+        num_samples = min(num_calibration_queries, len(texts))
+        texts = random.Random(seed).sample(texts, num_samples)
+
+    retriever = HypencoderReverseRetriever(
+        model_name_or_path=model_name_or_path,
+        encoded_item_path=encoded_item_path,
+        item_batch_size=item_batch_size,
+        dtype=dtype,
+        query_max_length=query_max_length,
+        use_calibration=False,
+    )
+    retriever.index.save_calibration(
+        retriever.calibrate(texts),
+        info={
+            "queries": calibration_queries,
+            "num_queries": len(texts),
+            "query_max_length": query_max_length,
+            "seed": seed,
+        },
+    )
+    print(f"Saved calibration from {len(texts)} queries.")
+
+
+if __name__ == "__main__":
+    fire.Fire(calibrate_q_net_index)
