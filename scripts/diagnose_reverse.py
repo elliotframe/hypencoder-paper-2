@@ -64,12 +64,15 @@ with torch.no_grad():
     )
 
     # Forward (normal) score matrix for comparison: F[q, d] = qnet_q(emb_d).
-    d_emb = torch.cat(
-        [
-            dual.passage_encoder(**tokenize(texts[i : i + 128])).representation
-            for i in range(0, len(texts), 128)
-        ]
-    )
+    d_emb = []
+    for i in range(0, len(texts), 128):
+        t = tokenize(texts[i : i + 128])
+        d_emb.append(
+            dual.passage_encoder(
+                t["input_ids"], t["attention_mask"]
+            ).representation
+        )
+    d_emb = torch.cat(d_emb)
     rows = []
     for q in queries:
         t = tokenize([q.text])
