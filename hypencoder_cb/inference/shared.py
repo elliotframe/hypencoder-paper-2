@@ -1,6 +1,7 @@
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
@@ -118,6 +119,7 @@ def encode_items_to_disk(
     output_path: str,
     batch_size: int = 32,
 ) -> None:
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     encoded_iter = encode_items(encoder, items, batch_size=batch_size)
     DocList[EncodedItem].push_stream(
         encoded_iter,
