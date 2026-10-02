@@ -97,13 +97,13 @@ def load_data(data_config: HypencoderDataConfig):
 
     validation_data = None
     if data_config.validation_huggingface_dataset is not None:
-        training_data = load_dataset(
+        validation_data = load_dataset(
             data_config.validation_huggingface_dataset,
             split=data_config.validation_data_split,
             cache_dir=cache_dir,
         )
     elif data_config.validation_data_jsonl is not None:
-        training_data = load_dataset(
+        validation_data = load_dataset(
             "json",
             data_files=data_config.validation_data_jsonl,
             split=data_config.validation_data_split,
@@ -120,7 +120,7 @@ def get_collator(
 ):
     return GeneralDualEncoderCollator(
         tokenizer=tokenizer,
-        num_negatives_to_sample=data_config.num_items_to_sample,
+        num_negatives_to_sample=data_config.num_negatives_to_sample,
         positive_filter=data_config.positive_filter_type,
         positive_filter_kwargs=data_config.positive_filter_kwargs,
         positive_sampler="random",

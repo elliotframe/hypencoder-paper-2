@@ -1,3 +1,4 @@
+import copy
 import os
 import pickle
 import random
@@ -7,7 +8,6 @@ from typing import Dict, List, Optional, Union
 
 import fire
 import torch
-from numpy import copy
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -39,6 +39,7 @@ class HypecoderGraphRetriever(BaseRetriever):
         max_iter: int = 16,
         early_stop: bool = True,
         dtype: Union[torch.dtype, str] = "float32",
+        ignore_same_id: bool = False,
     ) -> None:
         """
 
@@ -70,6 +71,9 @@ class HypecoderGraphRetriever(BaseRetriever):
                 to True.
             dtype (Union[torch.dtype, str], optional): The dtype to use for
                 the model and embeddings. Defaults to "float32".
+            ignore_same_id (bool, optional): Whether to ignore retrievals
+                with the same ID as the query. This is only relevant for
+                certain datasets. Defaults to False.
         """
 
         if isinstance(dtype, str):
@@ -84,6 +88,7 @@ class HypecoderGraphRetriever(BaseRetriever):
         self.max_iter = max_iter
         self.query_max_length = query_max_length
         self.early_stop = early_stop
+        self.ignore_same_id = ignore_same_id
 
         print(model_name_or_path)
         self.model = (
@@ -210,15 +215,15 @@ class HypecoderGraphRetriever(BaseRetriever):
                 [self.item_id_to_index[x] for x in candidates]
             ]
             candidate_embeddings = candidate_embeddings.unsqueeze(0)
-            similarity_matrix = query_model(candidate_embeddings).squeeze()
+            similarity_matrix = query_model(candidate_embeddings).view(-1)
 
             ncandidates = min(
                 max(self.ncandidates, top_k), similarity_matrix.shape[0]
             )
             values, indices = torch.topk(similarity_matrix, ncandidates, dim=0)
 
-            indices = indices.squeeze(0).cpu()
-            values = values.squeeze(0).cpu()
+            indices = indices.view(-1).cpu()
+            values = values.view(-1).cpu()
 
             prev_candidates = copy.deepcopy(candidates)
             candidates = []
@@ -263,6 +268,9 @@ class HypecoderGraphRetriever(BaseRetriever):
         items = []
         while not final_queue.empty():
             score, item_id = final_queue.get()
+            if self.ignore_same_id and query.id == item_id:
+                continue
+
             items.append(
                 Item(
                     text=self.item_id_to_content[item_id],

@@ -67,7 +67,7 @@ Approximate retrieval requires an item-to-item graph. To get this graph use the 
 export ENCODING_PATH="..."
 export ITEM_NEIGHBOR_GRAPH="..."
 python hypencoder_cb/inference/neighbor_graph.py \
---encoded_item_path=$ENCODING_PATH \
+--encoded_items_path=$ENCODING_PATH \
 --output_path=$ITEM_NEIGHBOR_GRAPH \
 --batch_size=100 \
 --top_k=100 \

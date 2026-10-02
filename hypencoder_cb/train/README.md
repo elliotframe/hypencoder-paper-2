@@ -71,7 +71,7 @@ data_config:
 If your positive has a specific `type` value (see the data preparation section for more details) use:
 ```
 data_config:
-    type: first
+    positive_filter_type: type
     positive_filter_kwargs:
         positive_type: your-positive-type-name-here
 ```
