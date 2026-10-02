@@ -240,8 +240,9 @@ def do_eval_and_pretty_print(
 
 
 def do_retrieval_shared(
-    retriever_cls,
-    retriever_kwargs: Dict,
+    retriever_cls=None,
+    retriever_kwargs: Optional[Dict] = None,
+    *,
     output_dir: str,
     ir_dataset_name: Optional[str] = None,
     query_jsonl: Optional[str] = None,
@@ -252,12 +253,15 @@ def do_retrieval_shared(
     include_content: bool = True,
     do_eval: bool = True,
     metric_names: Optional[List[str]] = None,
+    retriever: Optional[BaseRetriever] = None,
 ) -> None:
     """Does retrieval and optionally evaluation.
 
     Args:
-        retriever_cls (BaseRetriever): The retriever class to use.
+        retriever_cls (BaseRetriever): The retriever class to use. Not used if
+            `retriever` is provided.
         retriever_kwargs (Dict): The keyword arguments to pass to the retriever.
+            Not used if `retriever` is provided.
         output_dir (str): Path to the output directory which will contain the
             retrieval results and optionally the evaluation results.
         ir_dataset_name (Optional[str], optional): If provided is used to
@@ -286,11 +290,22 @@ def do_retrieval_shared(
         metric_names (Optional[List[str]], optional): A list of metrics to
             compute. These are passed to IR-Measures so should be compatible.
             If None, a default set of metrics is found. Defaults to None.
+        retriever (Optional[BaseRetriever], optional): An already created
+            retriever to use instead of creating one from `retriever_cls`.
+            This lets several runs share one loaded retriever. Defaults to
+            None.
     Raises:
+        ValueError: If both or neither of `retriever` and `retriever_cls` are
+            provided.
         ValueError: If both `query_jsonl` and `ir_dataset_name` are provided.
         ValueError: If `do_eval` is True and `ir_dataset_name` is None and
             `qrel_json` is None.
     """
+
+    if (retriever is None) == (retriever_cls is None):
+        raise ValueError(
+            "Exactly one of retriever and retriever_cls must be provided."
+        )
 
     if query_jsonl is not None and ir_dataset_name is not None:
         raise ValueError(
@@ -309,9 +324,8 @@ def do_retrieval_shared(
     retrieval_file = output_dir / "retrieved_items.jsonl"
     metric_dir = output_dir / "metrics"
 
-    retriever = retriever_cls(
-        **retriever_kwargs
-    )
+    if retriever is None:
+        retriever = retriever_cls(**(retriever_kwargs or {}))
 
     if query_jsonl is not None:
         retrieve_for_jsonl_queries(
@@ -333,6 +347,7 @@ def do_retrieval_shared(
             include_content=include_content,
             include_type=include_content,
             track_time=True,
+            track_time_file=output_dir / "timing.json",
         )
 
     if do_eval:

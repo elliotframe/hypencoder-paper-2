@@ -14,6 +14,7 @@ from hypencoder_cb.inference.entry_points import (
     BM25EntryPoints,
     EntryPointSelector,
     RandomEntryPoints,
+    load_bm25_index,
 )
 from hypencoder_cb.inference.retrieve import do_retrieval_shared
 from hypencoder_cb.inference.shared import (
@@ -28,6 +29,18 @@ from hypencoder_cb.utils.torch_utils import dtype_lookup
 
 
 class HypecoderGraphRetriever(BaseRetriever):
+    # Parameters that `with_search_params` can change without reloading the
+    # model, embeddings, neighbor graph, or BM25 index.
+    SEARCH_PARAMS = (
+        "num_entry_points",
+        "ncandidates",
+        "max_iter",
+        "early_stop",
+        "ignore_same_id",
+        "entry_points",
+        "bm25_k1",
+        "bm25_b",
+    )
 
     def __init__(
         self,
@@ -87,19 +100,13 @@ class HypecoderGraphRetriever(BaseRetriever):
                 uses the query's top BM25 results, falling back to the random
                 items when BM25 matches nothing. Defaults to "random".
             bm25_index_path (Optional[str], optional): Directory of the PISA
-                index used when `entry_points` is "bm25". It is built from the
-                encoded items if it does not exist. Defaults to None.
+                index. Required when `entry_points` is "bm25", and also needed
+                for `with_search_params` to switch to "bm25" later. It is
+                built from the encoded items if it does not exist. Defaults
+                to None.
             bm25_k1 (float, optional): BM25 k1. Defaults to 1.5.
             bm25_b (float, optional): BM25 b. Defaults to 0.75.
         """
-
-        if entry_points not in ("random", "bm25"):
-            raise ValueError(f"Unknown entry_points type: {entry_points}")
-
-        if entry_points == "bm25" and bm25_index_path is None:
-            raise ValueError(
-                "bm25_index_path must be provided when entry_points is 'bm25'."
-            )
 
         if isinstance(dtype, str):
             dtype = dtype_lookup(dtype)
@@ -114,6 +121,15 @@ class HypecoderGraphRetriever(BaseRetriever):
         self.query_max_length = query_max_length
         self.early_stop = early_stop
         self.ignore_same_id = ignore_same_id
+        self.entry_points = entry_points
+        self.bm25_k1 = bm25_k1
+        self.bm25_b = bm25_b
+        self.bm25_index = None
+
+        if entry_points == "bm25" and bm25_index_path is None:
+            raise ValueError(
+                "bm25_index_path must be provided when entry_points is 'bm25'."
+            )
 
         print(model_name_or_path)
         self.model = (
@@ -195,6 +211,23 @@ class HypecoderGraphRetriever(BaseRetriever):
                 with open(cache_file, "wb") as f:
                     pickle.dump(cache_values, f)
 
+        if bm25_index_path is not None:
+            self.bm25_index = load_bm25_index(
+                bm25_index_path, self.item_id_to_content.items()
+            )
+
+        self._set_entry_point_selectors()
+
+    def _set_entry_point_selectors(self) -> None:
+        if self.entry_points not in ("random", "bm25"):
+            raise ValueError(f"Unknown entry_points type: {self.entry_points}")
+
+        if self.entry_points == "bm25" and self.bm25_index is None:
+            raise ValueError(
+                "entry_points='bm25' requires the retriever to be created"
+                " with bm25_index_path."
+            )
+
         self.random_entry_points = RandomEntryPoints(
             self.ids, self.num_entry_points
         )
@@ -202,14 +235,41 @@ class HypecoderGraphRetriever(BaseRetriever):
         self.entry_point_selector: EntryPointSelector = (
             self.random_entry_points
         )
-        if entry_points == "bm25":
+        if self.entry_points == "bm25":
             self.entry_point_selector = BM25EntryPoints(
-                index_path=bm25_index_path,
-                items=self.item_id_to_content.items(),
+                self.bm25_index,
                 num_entry_points=self.num_entry_points,
-                k1=bm25_k1,
-                b=bm25_b,
+                k1=self.bm25_k1,
+                b=self.bm25_b,
             )
+
+    def with_search_params(self, **params) -> "HypecoderGraphRetriever":
+        """Returns a copy of this retriever with different search parameters.
+
+        The copy shares the loaded model, embeddings, neighbor graph, and BM25
+        index with this retriever, so it is cheap to create. This retriever is
+        not changed.
+
+        Args:
+            **params: New values for any of `SEARCH_PARAMS`.
+
+        Returns:
+            HypecoderGraphRetriever: The retriever with the new parameters.
+        """
+        unknown_params = set(params) - set(self.SEARCH_PARAMS)
+        if unknown_params:
+            raise ValueError(
+                f"Cannot change {sorted(unknown_params)}, only"
+                f" {list(self.SEARCH_PARAMS)} can be changed."
+            )
+
+        retriever = copy.copy(self)
+        for name, value in params.items():
+            setattr(retriever, name, value)
+
+        retriever._set_entry_point_selectors()
+
+        return retriever
 
     def _get_entry_point_ids(self, query: TextQuery) -> List[str]:
         entry_point_ids = self.entry_point_selector.select(query)

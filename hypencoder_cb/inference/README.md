@@ -106,3 +106,34 @@ python hypencoder_cb/inference/approx_retrieve.py \
 --bm25_k1=1.5 \
 --bm25_b=0.75
 ```
+
+##### Reusing a loaded retriever for parameter sweeps
+Loading the model, encoded items, neighbor graph, and BM25 index is slow, so a sweep should load them once. `with_search_params` returns a copy of the retriever with different search parameters that shares all of that loaded state. The parameters it can change are listed in `HypecoderGraphRetriever.SEARCH_PARAMS`. Pass the copy to `do_retrieval_shared` with `retriever=` instead of `retriever_cls`. Each run writes its results, metrics, and `timing.json` to its own `output_dir`.
+```python
+from itertools import product
+
+from hypencoder_cb.inference.approx_retrieve import HypecoderGraphRetriever
+from hypencoder_cb.inference.retrieve import do_retrieval_shared
+
+base = HypecoderGraphRetriever(
+    model_name_or_path="jfkback/hypencoder.6_layer",
+    encoded_item_path="...",
+    item_neighbors_path="...",
+    bm25_index_path="...",  # Only needed for entry_points="bm25"
+)
+
+for entry_points, num_entry_points, ncandidates in product(
+    ["random", "bm25"], [100, 1000], [16, 64]
+):
+    retriever = base.with_search_params(
+        entry_points=entry_points,
+        num_entry_points=num_entry_points,
+        ncandidates=ncandidates,
+    )
+    do_retrieval_shared(
+        retriever=retriever,
+        output_dir=f"runs/{entry_points}-{num_entry_points}-{ncandidates}",
+        ir_dataset_name="msmarco-passage/trec-dl-2019/judged",
+        top_k=1000,
+    )
+```
