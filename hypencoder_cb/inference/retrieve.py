@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from hypencoder_cb.inference.reverse import HypencoderReverseRetriever
 from hypencoder_cb.inference.shared import (
     BaseRetriever,
     Item,
@@ -371,13 +372,14 @@ def do_retrieval(
     query_text_key: str = "text",
     dtype: str = "fp32",
     top_k: int = 1000,
-    batch_size: int = 100_000,
+    batch_size: Optional[int] = None,
     retriever_kwargs: Optional[Dict] = None,
     query_max_length: int = 64,
     include_content: bool = True,
     do_eval: bool = True,
     metric_names: Optional[List[str]] = None,
     ignore_same_id: bool = False,
+    reverse: bool = False,
 ) -> None:
     """Does retrieval and optionally evaluation.
 
@@ -407,8 +409,9 @@ def do_retrieval(
             items. Options are "fp16", "fp32", and "bf16". Defaults to "fp32".
         top_k (int, optional): The number of top items to retrieve. Defaults to
             1000.
-        batch_size (int, optional): The batch size to use for retrieval.
-            Defaults to 100,000.
+        batch_size (Optional[int], optional): The number of items scored at
+            once. If None, 100,000 is used, or 64 when `reverse` is True.
+            Defaults to None.
         retriever_kwargs (Optional[Dict], optional): Additional keyword
             arguments to pass to the retriever. Defaults to None.
         query_max_length (int, optional): Maximum length of the query.
@@ -422,6 +425,12 @@ def do_retrieval(
         ignore_same_id (bool, optional): Whether to ignore retrievals with the
             same ID as the query. This is only relevant for certain datasets.
             Defaults to False.
+        reverse (bool, optional): If True, does reverse retrieval: queries
+            are encoded as vectors and scored by each item's q-net.
+            `encoded_item_path` must then be a q-net index made with
+            `encode.py --representation_type=q_net`. Extra arguments such as
+            `query_batch_size` can be passed through `retriever_kwargs`, see
+            `HypencoderReverseRetriever`. Defaults to False.
 
     Raises:
         ValueError: If both `query_jsonl` and `ir_dataset_name` are provided.
@@ -431,15 +440,22 @@ def do_retrieval(
 
     retriever_kwargs = retriever_kwargs if retriever_kwargs is not None else {}
 
+    if reverse:
+        retriever_cls = HypencoderReverseRetriever
+        batch_size_kwargs = dict(item_batch_size=batch_size or 64)
+    else:
+        retriever_cls = HypencoderRetriever
+        batch_size_kwargs = dict(batch_size=batch_size or 100_000)
+
     do_retrieval_shared(
-        retriever_cls=HypencoderRetriever,
+        retriever_cls=retriever_cls,
         retriever_kwargs=dict(
             model_name_or_path=model_name_or_path,
             encoded_item_path=encoded_item_path,
             dtype=dtype,
-            batch_size=batch_size,
             query_max_length=query_max_length,
             ignore_same_id=ignore_same_id,
+            **batch_size_kwargs,
             **retriever_kwargs,
         ),
         output_dir=output_dir,

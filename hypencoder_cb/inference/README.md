@@ -60,6 +60,31 @@ Evaluation is done automatically when `hypencoder_cb/inference/retrieve.py` is c
 }
 ```
 
+#### Reverse Retrieval
+Reverse retrieval swaps the roles of queries and items. The hypernetwork generates a q-net for every item at encoding time, and each query is encoded as a vector that is fed into every item's q-net. The pretrained models were trained the normal way round, so expect much lower effectiveness from them in reverse.
+
+Each q-net is stored in full, which takes about 7 MB per item in fp16 for the 6 layer model, so this only suits small corpora (BEIR NFCorpus, with about 3.6k documents, needs about 25 GB). Generating many q-nets at once also needs a lot of GPU memory, so use a small `--batch_size`.
+```
+export QNET_INDEX_DIR="..."
+export MODEL_NAME_OR_PATH="jfkback/hypencoder.6_layer"
+export RETRIEVAL_DIR="..."
+python hypencoder_cb/inference/encode.py \
+--model_name_or_path=$MODEL_NAME_OR_PATH \
+--output_path=$QNET_INDEX_DIR \
+--ir_dataset_name=beir/nfcorpus/test \
+--representation_type=q_net \
+--batch_size=16
+
+python hypencoder_cb/inference/retrieve.py \
+--model_name_or_path=$MODEL_NAME_OR_PATH \
+--encoded_item_path=$QNET_INDEX_DIR \
+--output_dir=$RETRIEVAL_DIR \
+--ir_dataset_name=beir/nfcorpus/test \
+--query_max_length=512 \
+--reverse=True
+```
+`--output_path` is a directory holding `q_nets.bin` (memory mapped at retrieval time), `items.jsonl`, and `meta.json`. Retrieval reads each batch of `--batch_size` q-nets (default 64) once and scores all queries with it, so a whole query set costs one pass over the index. `timing.json` therefore records the total time for the query set rather than per-query latency.
+
 #### Approximate Retrieval
 ##### Getting a Item Neighbor Graph
 Approximate retrieval requires an item-to-item graph. To get this graph use the following command:

@@ -154,6 +154,8 @@ def encode_jsonl_items_to_disk(
 class BaseRetriever:
     implements_retrieve_text = False
     implements_retrieve = False
+    # If True, `retrieve_items` hands all queries to `retrieve_batch` at once.
+    implements_retrieve_batch = False
 
     def retrieve_text(
         self, query: TextQuery, top_k: Optional[int] = None
@@ -163,6 +165,11 @@ class BaseRetriever:
     def retrieve(
         self, query: BaseQuery, top_k: Optional[int] = None
     ) -> List[Item]:
+        raise NotImplementedError
+
+    def retrieve_batch(
+        self, queries: List[BaseQuery], top_k: Optional[int] = None
+    ) -> List[List[Item]]:
         raise NotImplementedError
 
 
@@ -242,14 +249,25 @@ def retrieve_items(
         start_time = time.time()
         num_queries = 0
 
-    for query in tqdm(queries):
-        yield query, retriever.retrieve(query, top_k=top_k)
+    if getattr(retriever, "implements_retrieve_batch", False):
+        queries = list(queries)
+        results = retriever.retrieve_batch(queries, top_k=top_k)
+        if track_time:
+            num_queries = len(queries)
+            end_time = time.time()
+
+        yield from zip(queries, results)
+    else:
+        for query in tqdm(queries):
+            yield query, retriever.retrieve(query, top_k=top_k)
+
+            if track_time:
+                num_queries += 1
 
         if track_time:
-            num_queries += 1
+            end_time = time.time()
 
     if track_time:
-        end_time = time.time()
         print(
             f"Retrieved {num_queries} queries in {end_time - start_time}"
             f" seconds. That's {num_queries / (end_time - start_time)} queries"
