@@ -191,7 +191,7 @@ def main(
         if method == "layered":
             method, k = "svd", k[0] if i == big[0] else k[1]
             if k == 0:
-                return means[i], []
+                return means[i].expand(M.size(0), -1, -1), []
 
         D = M - means[i]
         vec_l, vec_r, eval_l, eval_r = bases[i]
